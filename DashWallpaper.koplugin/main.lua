@@ -40,7 +40,7 @@ local DashWallpaper = WidgetContainer:extend{
 
 local SETTINGS_FILE = "dashwallpaper.lua"
 
--- 开箱即用的内置壁纸源：对应 DashViewer 的三个数据源，壁纸 PNG 由云端每日自动生成
+-- 开箱即用的内置壁纸源：对应 DashViewer 的三个数据源，壁纸 PNG 由云端按请求 IP 现场生成
 local DEFAULT_WALLS = {
     { name = "肿瘤新药动态 · 壁纸", url = "https://9c18b55628f847a3a6628b3e2cada237.app.workbuddy.link/wallpaper" },
     { name = "豆瓣影视新书 · 壁纸", url = "https://9c18b55628f847a3a6628b3e2cada237.app.workbuddy.link/wallpaper?theme=douban" },
@@ -51,9 +51,42 @@ local DEFAULT_WALLS = {
 -- 已对齐版本的不再改动，保留用户自己的增删。
 local DEFAULTS_VERSION = 2
 
+-- 可选城市：中国主要城市 + 世界主要城市。下载壁纸时把所选城市带上，
+-- 服务端按城市名取天气，彻底绕开"经反代后请求 IP 变成代理出口（如北京）"的问题。
+local CITY_CHOICES = {
+    "上海", "北京", "广州", "深圳", "杭州", "成都", "武汉", "南京", "西安", "重庆",
+    "苏州", "天津", "长沙", "青岛", "厦门", "宁波", "郑州", "无锡", "福州", "济南",
+    "合肥", "昆明", "大连", "哈尔滨", "沈阳", "石家庄", "南宁", "贵阳", "太原", "长春",
+    "南昌", "兰州", "海口", "呼和浩特", "银川", "西宁", "乌鲁木齐", "拉萨", "香港", "澳门", "台北",
+    "东京", "纽约", "伦敦", "巴黎", "首尔", "新加坡", "曼谷", "悉尼", "墨尔本", "洛杉矶",
+    "旧金山", "西雅图", "芝加哥", "波士顿", "多伦多", "温哥华", "柏林", "莫斯科", "迪拜",
+    "罗马", "马德里", "阿姆斯特丹", "苏黎世", "维也纳", "斯德哥尔摩", "哥本哈根", "都柏林",
+    "雅典", "华沙", "布拉格", "里斯本", "开罗", "伊斯坦布尔", "孟买", "新德里", "吉隆坡",
+    "雅加达", "马尼拉", "胡志明市", "河内", "大阪", "京都", "圣保罗", "墨西哥城",
+    "布宜诺斯艾利斯", "约翰内斯堡",
+}
+
+-- UTF-8 百分号编码：把中文城市名安全放进 URL 查询参数
+local function urlEncode(s)
+    if not s then return "" end
+    s = tostring(s)
+    local out = {}
+    for i = 1, #s do
+        local b = string.byte(s, i)
+        if (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+            or b == 45 or b == 46 or b == 95 or b == 126 then
+            out[#out + 1] = string.char(b)
+        else
+            out[#out + 1] = string.format("%%%02X", b)
+        end
+    end
+    return table.concat(out)
+end
+
 function DashWallpaper:init()
     self.walls = {}
     self.settings = LuaSettings:open(DataStorage:getDataDir() .. "/" .. SETTINGS_FILE)
+    self.my_city = self.settings:readSetting("my_city") or "上海"
 
     -- 设置读写整体包一层 pcall：即便存档损坏，也不会让插件在加载期崩溃、从菜单消失
     local ok = pcall(function()
@@ -140,13 +173,45 @@ function DashWallpaper:buildSubmenu()
         }
     end
 
-    -- 新增壁纸源：仅保留「从文件导入」，避免软键盘遮挡卡死
+    -- 「我的城市」：用 KOReader 原生子菜单（sub_item_table）列出城市，点进去选即可。
+    -- 不用 show(Menu) 弹独立菜单，避免在主菜单（TouchMenu）上下文里弹 Menu 控件导致崩溃。
+    local ct = {}
+    ct[#ct + 1] = {
+        text = "↺ 恢复默认（上海）",
+        callback = function()
+            self.my_city = "上海"
+            self.settings:saveSetting("my_city", "上海")
+            self.settings:flush()
+            local top = UIManager:getTopmostVisibleWidget()
+            if top then UIManager:close(top, "flashui") end
+            UIManager:show(InfoMessage:new{ text = "已恢复默认城市：上海" })
+        end,
+    }
+    for _, c in ipairs(CITY_CHOICES) do
+        ct[#ct + 1] = {
+            text = (c == self.my_city and "✓ " or "") .. c,
+            callback = function()
+                self.my_city = c
+                self.settings:saveSetting("my_city", c)
+                self.settings:flush()
+                local top = UIManager:getTopmostVisibleWidget()
+                if top then UIManager:close(top, "flashui") end
+                UIManager:show(InfoMessage:new{
+                    text = "已设置城市：「" .. c .. "」\n下次应用壁纸时生效（天气按该城市）。",
+                })
+            end,
+        }
+    end
+    t[#t + 1] = {
+        text = "📍 我的城市：" .. self.my_city .. "（点进去切换）",
+        sub_item_table = ct,
+    }
     t[#t + 1] = { text = "📄 从文件导入（dashwall_sources.txt）", callback = function() self:addFromFile() end }
     t[#t + 1] = {
         text = "❔ 使用说明",
         callback = function()
             UIManager:show(InfoMessage:new{
-                text = "• 已内置「肿瘤新药」「豆瓣影视新书」「微信读书榜单」三张壁纸，点「应用」即下载到屏保目录\n"
+                text = "• 天气按「我的城市」显示（默认上海，点「我的城市」可切换，含世界主要城市）\n" .. "• 已内置「肿瘤新药」「豆瓣影视新书」「微信读书榜单」三张壁纸，点「应用」即下载到屏保目录\n"
                     .. "• 让 Kindle 进入休眠即可看到该看板壁纸\n"
                     .. "• 长按壁纸名称：删除该壁纸源\n"
                     .. "• 新增壁纸源：电脑写好 dashwall_sources.txt（每行 名称<TAB>壁纸URL），\n"
@@ -198,6 +263,18 @@ function DashWallpaper:candidateUrls(url)
     return urls
 end
 
+-- 给壁纸 URL 追加所选城市参数（服务端按城市名取天气，绕开 IP 反代问题）
+function DashWallpaper:withCity(url)
+    local city = self.my_city
+    if not city or city == "" then city = "上海" end
+    local sep = url:find("%?") and "&" or "?"
+    return url .. sep .. "city=" .. urlEncode(city)
+end
+
+-- 「我的城市」选择已改为主菜单原生子菜单（见 buildSubmenu 的 sub_item_table），
+-- 不再用 show(Menu) 弹独立菜单，避免在主菜单（TouchMenu）上下文里崩溃。
+-- 城市列表与当前选中项在 buildSubmenu() 里动态生成。
+
 -- 下载并校验：是合法 PNG 才返回字节，否则返回 nil
 function DashWallpaper:downloadPng(url)
     http.TIMEOUT = 60
@@ -221,7 +298,7 @@ function DashWallpaper:applyWall(w)
     UIManager:show(InfoMessage:new{ text = "正在下载壁纸: " .. w.name })
     local raw = nil
     local used = nil
-    for _, u in ipairs(self:candidateUrls(w.url)) do
+    for _, u in ipairs(self:candidateUrls(self:withCity(w.url))) do
         raw = self:downloadPng(u)
         if raw then used = u; break end
     end
