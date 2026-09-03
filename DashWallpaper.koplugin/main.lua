@@ -42,8 +42,8 @@ local SETTINGS_FILE = "dashwallpaper.lua"
 
 -- 开箱即用的内置壁纸源：对应 DashViewer 的两个数据源，壁纸 PNG 由云端每日自动生成
 local DEFAULT_WALLS = {
-    { name = "肿瘤新药动态 · 壁纸", url = "https://2435cc319f464e0eaaded08a80644163.app.workbuddy.link/wallpaper.png" },
-    { name = "豆瓣影视新书 · 壁纸", url = "https://b102a44faaf04c8ebaadb30e4783a396.app.workbuddy.link/wallpaper.png" },
+    { name = "肿瘤新药动态 · 壁纸", url = "https://9c18b55628f847a3a6628b3e2cada237.app.workbuddy.link/wallpaper" },
+    { name = "豆瓣影视新书 · 壁纸", url = "https://9c18b55628f847a3a6628b3e2cada237.app.workbuddy.link/wallpaper?theme=douban" },
 }
 
 function DashWallpaper:init()
