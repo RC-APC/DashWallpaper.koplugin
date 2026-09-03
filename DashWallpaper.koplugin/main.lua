@@ -51,6 +51,12 @@ local DEFAULT_WALLS = {
 -- 已对齐版本的不再改动，保留用户自己的增删。
 local DEFAULTS_VERSION = 2
 
+-- 每日自动更新：轮询间隔（秒）。Kindle 挂起期间 Lua 不运行，所以真正的触发点是
+-- 「唤醒后 / 进入休眠前 / 前台每 30 分钟轮询」三处补做，而不是严格的墙上时钟定时任务。
+local AUTO_CHECK_SECONDS = 30 * 60
+-- 可选更新时间（整点）：到达该时刻后，当天第一次联网时自动下载一次
+local AUTO_HOURS = { 0, 5, 6, 7, 8, 9, 12, 18, 21, 23 }
+
 -- 可选城市：中国主要城市 + 世界主要城市。下载壁纸时把所选城市带上，
 -- 服务端按城市名取天气，彻底绕开"经反代后请求 IP 变成代理出口（如北京）"的问题。
 local CITY_CHOICES = {
@@ -87,6 +93,14 @@ function DashWallpaper:init()
     self.walls = {}
     self.settings = LuaSettings:open(DataStorage:getDataDir() .. "/" .. SETTINGS_FILE)
     self.my_city = self.settings:readSetting("my_city") or "上海"
+
+    -- 每日自动更新的配置（首次运行默认开启，早上 6 点后第一次联网时补做）
+    self.auto_enabled = self.settings:readSetting("auto_enabled")
+    if self.auto_enabled == nil then self.auto_enabled = true end
+    self.auto_hour = tonumber(self.settings:readSetting("auto_hour")) or 6
+    self.auto_index = tonumber(self.settings:readSetting("auto_index")) or 1
+    self.last_auto_date = self.settings:readSetting("last_auto_date") or ""
+    self.last_auto_status = self.settings:readSetting("last_auto_status") or ""
 
     -- 设置读写整体包一层 pcall：即便存档损坏，也不会让插件在加载期崩溃、从菜单消失
     local ok = pcall(function()
@@ -129,6 +143,9 @@ function DashWallpaper:init()
         }
     end
 
+    -- 启动每日自动更新的轮询链：包 pcall，任何异常都不能影响插件加载、菜单注册
+    pcall(function() self:autoSchedule(8) end)
+
     self.ui.menu:registerToMainMenu(self)
 end
 
@@ -158,11 +175,21 @@ function DashWallpaper:addToReaderMenu(menu_items)
 end
 
 function DashWallpaper:buildSubmenu()
+    -- 菜单按「功能类别」分组，避免十几项混在一屏、分不清用途：
+    --   看板壁纸源     = 有哪些看板壁纸 + 点「应用」下载 / 长按删除 / 导入
+    --   我的城市       = 壁纸天气按哪个城市
+    --   每日自动更新   = 自动下载的开关 / 时间 / 来源 / 状态
+    --   使用说明       = 帮助
+    -- 分类用 KOReader 原生子菜单实现；会变的值一律 text_func（菜单项表只构建一次并缓存）。
     local t = {}
 
-    -- 各壁纸源
+    -- 组 1：看板壁纸源
+    local ws = {}
+    if #self.walls == 0 then
+        ws[#ws + 1] = { text = "（暂无壁纸源，请先导入）", enabled = false }
+    end
     for i, w in ipairs(self.walls) do
-        t[#t + 1] = {
+        ws[#ws + 1] = {
             text = "应用：" .. w.name,
             callback = function()
                 self:applyWall(w)
@@ -172,13 +199,18 @@ function DashWallpaper:buildSubmenu()
             end,
         }
     end
+    ws[#ws + 1] = { text = "从文件导入（dashwall_sources.txt）", callback = function() self:addFromFile() end }
+    t[#t + 1] = {
+        text_func = function()
+            return "看板壁纸源：" .. #self.walls .. " 张"
+        end,
+        sub_item_table = ws,
+    }
 
-    -- 「我的城市」：用 KOReader 原生子菜单（sub_item_table）列出城市，点进去选即可。
-    -- 父项与子项都用 text_func 动态取文本：主菜单项表会被缓存、不会每次打开都重建，
-    -- 所以必须用 text_func（每次渲染重新求值），否则切了城市菜单里仍显示旧值。
+    -- 组 2：我的城市（壁纸上的天气按该城市显示）
     local ct = {}
     ct[#ct + 1] = {
-        text = "↺ 恢复默认（上海）",
+        text = "恢复默认（上海）",
         callback = function()
             self.my_city = "上海"
             self.settings:saveSetting("my_city", "上海")
@@ -191,7 +223,7 @@ function DashWallpaper:buildSubmenu()
     for _, c in ipairs(CITY_CHOICES) do
         ct[#ct + 1] = {
             text_func = function()
-                return (c == self.my_city and "✓ " or "") .. c
+                return c
             end,
             callback = function()
                 self.my_city = c
@@ -207,29 +239,117 @@ function DashWallpaper:buildSubmenu()
     end
     t[#t + 1] = {
         text_func = function()
-            return "📍 我的城市：" .. self.my_city .. "（点进去切换）"
+            return "我的城市：" .. self.my_city
         end,
         sub_item_table = ct,
     }
-    t[#t + 1] = { text = "📄 从文件导入（dashwall_sources.txt）", callback = function() self:addFromFile() end }
+
+    -- 组 3：每日自动更新
+    local ut = {}
+    ut[#ut + 1] = {
+        text_func = function()
+            return "每日自动更新：" .. (self.auto_enabled and "开" or "关")
+        end,
+        callback = function()
+            self.auto_enabled = not self.auto_enabled
+            self.settings:saveSetting("auto_enabled", self.auto_enabled)
+            self.settings:flush()
+        end,
+    }
+    local ht = {}
+    for _, h in ipairs(AUTO_HOURS) do
+        ht[#ht + 1] = {
+            text_func = function()
+                return string.format("%02d:00", h)
+            end,
+            callback = function()
+                self.auto_hour = h
+                self.settings:saveSetting("auto_hour", h)
+                self.settings:flush()
+            end,
+        }
+    end
+    ut[#ut + 1] = {
+        text_func = function()
+            return "更新时间：" .. string.format("%02d:00", self.auto_hour) .. " 之后"
+        end,
+        sub_item_table = ht,
+    }
+    local asrc = {}
+    if #self.walls == 0 then
+        asrc[#asrc + 1] = { text = "（暂无壁纸源，请先导入）", enabled = false }
+    end
+    for i, w in ipairs(self.walls) do
+        asrc[#asrc + 1] = {
+            text = w.name,
+            callback = function()
+                self.auto_index = i
+                self.settings:saveSetting("auto_index", i)
+                self.settings:flush()
+            end,
+        }
+    end
+    ut[#ut + 1] = {
+        text_func = function()
+            local w = self.walls[self.auto_index] or self.walls[1]
+            return "自动更新源：" .. (w and w.name or "未设置")
+        end,
+        sub_item_table = asrc,
+    }
+    ut[#ut + 1] = {
+        text = "上次更新状态",
+        text_func = function()
+            return "上次更新：" .. (self.last_auto_status ~= "" and self.last_auto_status or "尚未执行")
+        end,
+        callback = function()
+            local w = self.walls[self.auto_index] or self.walls[1]
+            UIManager:show(InfoMessage:new{
+                text = "上次自动更新：" .. (self.last_auto_status ~= "" and self.last_auto_status or "尚未执行")
+                    .. "\n今天：" .. os.date("%Y-%m-%d %H:%M")
+                    .. "\n更新源：" .. (w and w.name or "未设置")
+                    .. "\n\n说明：Kindle 休眠时程序不运行，"
+                    .. "\n所以采用「唤醒后 / 休眠前 / 前台每 30 分钟」\n三处补做，保证每天至少更新一次。",
+            })
+        end,
+    }
+    ut[#ut + 1] = {
+        text = "立即更新一次",
+        callback = function()
+            UIManager:show(InfoMessage:new{ text = "正在下载当日壁纸…" })
+            UIManager:scheduleIn(0.1, function()
+                self:runAutoUpdate(true)
+                UIManager:show(InfoMessage:new{
+                    text = "已执行。结果：" .. (self.last_auto_status ~= "" and self.last_auto_status or "未知"),
+                })
+            end)
+        end,
+    }
     t[#t + 1] = {
-        text = "❔ 使用说明",
+        text_func = function()
+            return "每日自动更新：" .. (self.auto_enabled and "开" or "关")
+        end,
+        sub_item_table = ut,
+    }
+
+    -- 组 4：使用说明
+    t[#t + 1] = {
+        text = "使用说明",
         callback = function()
             UIManager:show(InfoMessage:new{
-                text = "• 天气按「我的城市」显示（默认上海，点「我的城市」可切换，含世界主要城市）\n" .. "• 已内置「肿瘤新药」「豆瓣影视新书」「微信读书榜单」三张壁纸，点「应用」即下载到屏保目录\n"
-                    .. "• 让 Kindle 进入休眠即可看到该看板壁纸\n"
-                    .. "• 长按壁纸名称：删除该壁纸源\n"
-                    .. "• 新增壁纸源：电脑写好 dashwall_sources.txt（每行 名称<TAB>壁纸URL），\n"
-                    .. "  推到 KOReader 数据目录后点「从文件导入」\n\n"
+                text = "- 看板壁纸源：点「应用」即下载到屏保目录，让 Kindle 进入休眠即可看到\n"
+                    .. "- 内置「肿瘤新药」「豆瓣影视新书」「微信读书榜单」三张壁纸\n"
+                    .. "- 天气按「我的城市」显示（默认上海，含中国及世界 90+ 城市）\n"
+                    .. "- 每日自动更新：默认开启，在设定时刻之后自动下载一次，\n"
+                    .. "  触发时机为「启动后 / 唤醒后 / 休眠前 / 前台每 30 分钟」，\n"
+                    .. "  保证每天至少更新一次（Kindle 休眠时程序不运行，故为补做机制）\n"
+                    .. "- 长按壁纸名称：删除该壁纸源\n"
+                    .. "- 新增壁纸源：电脑写好 dashwall_sources.txt（每行 名称<TAB>壁纸URL），\n"
+                    .. "  推到 KOReader 数据目录后点「看板壁纸源 -> 从文件导入」\n\n"
                     .. "（本插件只下载写入、不解码图片，故不会像图片模式那样崩出。）\n"
                     .. "若屏保不显示，请在 KOReader 设置里把屏保目录指向写入的路径。",
             })
         end,
     }
-
-    if #self.walls == 0 then
-        t[#t + 1] = { text = "（暂无壁纸源，请先导入）", enabled = false }
-    end
     return t
 end
 
@@ -242,11 +362,11 @@ function DashWallpaper:findScreensaverDir()
         "/mnt/us/koreader/screensaver",
     }
     for _, c in ipairs(candidates) do
-        local test = c .. "/.dashwall_probe"
-        local f = io.open(test, "w")
-        if f then
-            f:close()
-            os.remove(test)
+        -- 探测写入整体包 pcall：即便某个路径不可写或 os.remove 失败，也不影响插件
+        local ok, f = pcall(function() return io.open(c .. "/.dashwall_probe", "w") end)
+        if ok and f then
+            pcall(function() f:close() end)
+            pcall(function() os.remove(c .. "/.dashwall_probe") end)
             return c
         end
     end
@@ -281,8 +401,8 @@ end
 -- 城市列表与当前选中项在 buildSubmenu() 里动态生成。
 
 -- 下载并校验：是合法 PNG 才返回字节，否则返回 nil
-function DashWallpaper:downloadPng(url)
-    http.TIMEOUT = 60
+function DashWallpaper:downloadPng(url, timeout)
+    http.TIMEOUT = timeout or 60
     local resp = {}
     local _, code = http.request{
         url = url,
@@ -298,44 +418,139 @@ function DashWallpaper:downloadPng(url)
     return raw
 end
 
--- 下载壁纸 PNG 并写入屏保目录（全程不解码图片，绝不触发 imagewidget 崩溃）
-function DashWallpaper:applyWall(w)
-    UIManager:show(InfoMessage:new{ text = "正在下载壁纸: " .. w.name })
-    local raw = nil
-    local used = nil
+-- 纯逻辑：下载并写盘，不弹任何提示。返回 ok, 说明
+function DashWallpaper:downloadAndSave(w, timeout)
+    local raw, used = nil, nil
     for _, u in ipairs(self:candidateUrls(self:withCity(w.url))) do
-        raw = self:downloadPng(u)
+        raw = self:downloadPng(u, timeout)
         if raw then used = u; break end
     end
     if not raw then
-        UIManager:show(InfoMessage:new{
-            text = "下载失败或地址尚未部署壁纸。\n请确认已联网，并等待每日自动部署生成壁纸。\n"
-                .. "（也可先用「看板查看器」确认网络正常。）",
-        })
-        return
+        return false, "下载失败（可能无网络或壁纸未生成）"
     end
-
     local dir = self:findScreensaverDir()
     local out = dir .. "/dashwallpaper.png"
     local f = io.open(out, "wb")
     if not f then
-        UIManager:show(InfoMessage:new{
-            text = "无法写入屏保目录：\n" .. dir
-                .. "\n请检查 KOReader 屏保目录权限或设置。",
-        })
-        return
+        return false, "无法写入屏保目录: " .. dir
     end
     f:write(raw)
     f:close()
-
     local note = ""
-    if used and used:match("digest%.png$") then
-        note = "\n（当前用的是 digest.png 预览，专用壁纸部署后将自动升级）"
+    if used and used:match("digest%.png$") then note = "（用 digest.png 预览）" end
+    return true, out .. note
+end
+
+-- 下载壁纸 PNG 并写入屏保目录（全程不解码图片，绝不触发 imagewidget 崩溃）
+function DashWallpaper:applyWall(w)
+    UIManager:show(InfoMessage:new{ text = "正在下载壁纸: " .. w.name })
+    -- 让提示先渲染出来，再开始阻塞式下载
+    UIManager:scheduleIn(0.1, function()
+        local ok, msg = self:downloadAndSave(w)
+        if not ok then
+            UIManager:show(InfoMessage:new{
+                text = msg .. "。\n请确认已联网，并等待每日自动部署生成壁纸。\n"
+                    .. "（也可先用「看板查看器」确认网络正常。）",
+            })
+            return
+        end
+        local note = msg:match("（用 digest%.png 预览）") or ""
+        UIManager:show(InfoMessage:new{
+            text = "已应用壁纸：「" .. w.name .. "」\n保存到：" .. (msg:gsub("（用 digest%.png 预览）", "")) .. note
+                .. "\n\n让 Kindle 进入休眠即可看到。\n（若屏保不显示，请在 KOReader 设置里把屏保目录指向该路径。）",
+        })
+    end)
+end
+
+-- 网络是否可用：取不到 NetworkMgr 或拿不到明确结论时，返回 true 交由下载本身兜底
+function DashWallpaper:networkReady()
+    local ok, mgr = pcall(function() return require("ui/network/manager") end)
+    if not ok or not mgr then return true end
+    local st, r = pcall(function()
+        if mgr.isOnline and mgr:isOnline() then return true end
+        if mgr.isWifiOn and mgr:isWifiOn() then return true end
+        if mgr.isConnected and mgr:isConnected() then return true end
+        return false
+    end)
+    if not st then return true end
+    return r
+end
+
+-- 是否该执行今天的自动更新：开关开 + 今天没做过 + 当前已过设定时刻
+function DashWallpaper:shouldAutoRun()
+    if not self.auto_enabled then return false end
+    local today = os.date("%Y-%m-%d")
+    if self.last_auto_date == today then return false end
+    local hh = tonumber(os.date("%H")) or 0
+    if hh < (tonumber(self.auto_hour) or 6) then return false end
+    return true
+end
+
+-- 执行一次自动更新（静默，不弹窗打扰）。返回是否真的执行了
+function DashWallpaper:runAutoUpdate(force)
+    local ok, ran = pcall(function()
+        if not force and not self:shouldAutoRun() then return false end
+        if not self:networkReady() then
+            self.last_auto_status = "待联网（" .. os.date("%m-%d %H:%M") .. "）"
+            self.settings:saveSetting("last_auto_status", self.last_auto_status)
+            self.settings:flush()
+            return false
+        end
+        local idx = tonumber(self.auto_index) or 1
+        local w = self.walls[idx] or self.walls[1]
+        if not w then return false end
+
+        -- 先记日期再下载：避免下载卡住时反复重试
+        local today = os.date("%Y-%m-%d")
+        self.last_auto_date = today
+        self.settings:saveSetting("last_auto_date", today)
+
+        -- 休眠前补做时不能卡太久，用较短超时
+        local ok_dl, msg = self:downloadAndSave(w, 10)
+        if ok_dl then
+            self.last_auto_status = "成功 " .. os.date("%m-%d %H:%M")
+        else
+            -- 失败：清掉日期，30 分钟后再试（当天仍会补做）
+            self.last_auto_date = ""
+            self.settings:saveSetting("last_auto_date", "")
+            self.last_auto_status = "失败 " .. os.date("%m-%d %H:%M") .. "（稍后重试）"
+        end
+        self.settings:saveSetting("last_auto_status", self.last_auto_status)
+        self.settings:flush()
+        return true
+    end)
+    if not ok then
+        -- 出错详情保留前 60 字符，方便在菜单「上次更新」里直接看到原因
+        local detail = tostring(ran or "?")
+        if #detail > 60 then detail = detail:sub(1, 60) .. "…" end
+        self.last_auto_status = "异常：" .. detail .. " " .. os.date("%m-%d %H:%M")
+        pcall(function()
+            self.settings:saveSetting("last_auto_status", self.last_auto_status)
+            self.settings:flush()
+        end)
+        return false
     end
-    UIManager:show(InfoMessage:new{
-        text = "已应用壁纸：「" .. w.name .. "」\n保存到：" .. out .. note
-            .. "\n\n让 Kindle 进入休眠即可看到。\n（若屏保不显示，请在 KOReader 设置里把屏保目录指向该路径。）",
-    })
+    return ran
+end
+
+-- 定时轮询：每 AUTO_CHECK_SECONDS 检查一次，跨过午夜后自动补做
+function DashWallpaper:autoSchedule(delay)
+    UIManager:scheduleIn(delay or AUTO_CHECK_SECONDS, function()
+        self:runAutoUpdate(false)
+        self:autoSchedule(AUTO_CHECK_SECONDS)
+    end)
+end
+
+-- 从休眠唤醒 / 解锁时补做（Kindle 挂起期间 Lua 不运行，只能唤醒后补）
+function DashWallpaper:onResume()
+    UIManager:scheduleIn(3, function() self:runAutoUpdate(false) end)
+    return false
+end
+
+-- 进入休眠前先补做一次：保证"本次休眠"屏保就是当天最新的
+function DashWallpaper:onSuspend()
+    pcall(function() self:runAutoUpdate(false) end)
+    return false
 end
 
 -- 从文件批量导入（每行：名称<TAB>URL），完全不依赖屏幕键盘
