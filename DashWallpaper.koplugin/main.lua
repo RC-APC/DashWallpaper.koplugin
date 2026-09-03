@@ -174,7 +174,8 @@ function DashWallpaper:buildSubmenu()
     end
 
     -- 「我的城市」：用 KOReader 原生子菜单（sub_item_table）列出城市，点进去选即可。
-    -- 不用 show(Menu) 弹独立菜单，避免在主菜单（TouchMenu）上下文里弹 Menu 控件导致崩溃。
+    -- 父项与子项都用 text_func 动态取文本：主菜单项表会被缓存、不会每次打开都重建，
+    -- 所以必须用 text_func（每次渲染重新求值），否则切了城市菜单里仍显示旧值。
     local ct = {}
     ct[#ct + 1] = {
         text = "↺ 恢复默认（上海）",
@@ -189,7 +190,9 @@ function DashWallpaper:buildSubmenu()
     }
     for _, c in ipairs(CITY_CHOICES) do
         ct[#ct + 1] = {
-            text = (c == self.my_city and "✓ " or "") .. c,
+            text_func = function()
+                return (c == self.my_city and "✓ " or "") .. c
+            end,
             callback = function()
                 self.my_city = c
                 self.settings:saveSetting("my_city", c)
@@ -203,7 +206,9 @@ function DashWallpaper:buildSubmenu()
         }
     end
     t[#t + 1] = {
-        text = "📍 我的城市：" .. self.my_city .. "（点进去切换）",
+        text_func = function()
+            return "📍 我的城市：" .. self.my_city .. "（点进去切换）"
+        end,
         sub_item_table = ct,
     }
     t[#t + 1] = { text = "📄 从文件导入（dashwall_sources.txt）", callback = function() self:addFromFile() end }
