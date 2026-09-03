@@ -1,0 +1,8 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# KOReader runtime artifacts (not part of source)
+*.koplugin.zip
